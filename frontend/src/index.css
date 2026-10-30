@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    @apply bg-[#0a0e1a] text-gray-100 font-mono;
+    scroll-behavior: smooth;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-[#0f1629]; }
+  ::-webkit-scrollbar-thumb { @apply bg-[#1e2d4a] rounded; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-[#3b82f6]; }
+}
+
+@layer components {
+  .noc-panel {
+    @apply bg-[#0f1629] border border-[#1e2d4a] rounded-lg;
+  }
+  .noc-panel-header {
+    @apply px-4 py-3 border-b border-[#1e2d4a] flex items-center justify-between;
+  }
+  .badge-critical  { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-red-900/60 text-red-300 border border-red-700/50; }
+  .badge-major     { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-orange-900/60 text-orange-300 border border-orange-700/50; }
+  .badge-minor     { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-yellow-900/60 text-yellow-300 border border-yellow-700/50; }
+  .badge-warning   { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-amber-900/60 text-amber-300 border border-amber-700/50; }
+  .badge-info      { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-blue-900/60 text-blue-300 border border-blue-700/50; }
+  .badge-open      { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-red-900/40 text-red-400; }
+  .badge-resolved  { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-green-900/40 text-green-400; }
+  .badge-closed    { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-gray-700/40 text-gray-400; }
+  .btn-primary { @apply px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed; }
+  .btn-ghost   { @apply px-3 py-1.5 bg-transparent hover:bg-[#1e2d4a] text-gray-300 hover:text-white rounded-lg text-sm transition-colors; }
+  .stat-card   { @apply noc-panel p-4 flex flex-col gap-1; }
+  .input-field { @apply bg-[#0a0e1a] border border-[#1e2d4a] rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 placeholder-gray-600; }
+}
+
+/* Pulse animation for critical alarms */
+@keyframes critical-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+}
+.critical-pulse { animation: critical-pulse 2s ease-in-out infinite; }

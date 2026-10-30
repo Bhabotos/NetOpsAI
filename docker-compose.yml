@@ -1,0 +1,203 @@
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: netopsai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-netopsai}
+      POSTGRES_USER:     ${DB_USER:-netopsai}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      N8N_DB_NAME:       ${N8N_DB_NAME:-n8n}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/00-create-n8n-db.sh:/docker-entrypoint-initdb.d/00_create_n8n_db.sh:ro
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./database/seed_data.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-netopsai} -d ${DB_NAME:-netopsai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - netopsai
+
+  # ── Express Backend ───────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netopsai-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV:          production
+      PORT:              3001
+      DB_HOST:           postgres
+      DB_PORT:           5432
+      DB_NAME:           ${DB_NAME:-netopsai}
+      DB_USER:           ${DB_USER:-netopsai}
+      DB_PASSWORD:       ${DB_PASSWORD}
+      N8N_WEBHOOK_URL:   ${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/netopsai/alarm}
+      API_KEY:           ${API_KEY:-}
+      CORS_ORIGIN:       ${CORS_ORIGIN:-http://localhost:3000}
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - netopsai
+
+  # ── React Frontend ────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # '/api' is proxied to the backend by nginx (see frontend/nginx.conf)
+        VITE_API_URL: ${VITE_API_URL:-/api}
+        VITE_API_KEY: ${VITE_API_KEY:-}
+    container_name: netopsai-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    networks:
+      - netopsai
+
+  # ── n8n Workflow Engine ───────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:2.45.7
+    container_name: netopsai-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # n8n database (uses same PostgreSQL instance)
+      DB_TYPE:                    postgresdb
+      DB_POSTGRESDB_HOST:         postgres
+      DB_POSTGRESDB_PORT:         5432
+      DB_POSTGRESDB_DATABASE:     ${N8N_DB_NAME:-n8n}
+      DB_POSTGRESDB_USER:         ${DB_USER:-netopsai}
+      DB_POSTGRESDB_PASSWORD:     ${DB_PASSWORD}
+      # n8n settings
+      N8N_HOST:                   ${N8N_HOST:-localhost}
+      N8N_PORT:                   5678
+      N8N_PROTOCOL:               ${N8N_PROTOCOL:-http}
+      N8N_WEBHOOK_URL:            ${N8N_EXTERNAL_WEBHOOK_URL:-http://localhost:5678}
+      GENERIC_TIMEZONE:           ${TIMEZONE:-UTC}
+      N8N_LOG_LEVEL:              info
+      # n8n Assistant code sandbox (see sandbox-* services below)
+      N8N_INSTANCE_AI_SANDBOX_ENABLED:  "true"
+      N8N_INSTANCE_AI_SANDBOX_PROVIDER: n8n-sandbox
+      N8N_SANDBOX_SERVICE_URL:          http://sandbox-api:8080
+    env_file: ./sandbox/n8n.env          # N8N_SANDBOX_SERVICE_API_KEY only
+      # Lets workflows reach services on the host (e.g. a local Ollama at host.docker.internal:11434)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n-workflows:/import/workflows:ro
+    ports:
+      - "${N8N_HOST_PORT:-5678}:5678"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    networks:
+      - netopsai
+      - sandbox                          # lets n8n reach sandbox-api
+
+  # ── n8n Assistant Code Sandbox ────────────────────────────────────────────────
+  # Official n8n-sandbox-service stack (from docker/get-n8n-compose.yml at n8n@2.45.7),
+  # pinned to 1.8.1 — the sandbox release get-n8n.sh pairs with n8n 2.45.7.
+  # None of these publish ports; only n8n reaches sandbox-api over the 'sandbox' network.
+  sandbox-certs:
+    image: ghcr.io/n8n-io/n8n-sandbox-service-api:1.8.1
+    user: '0:0'
+    entrypoint: ['sh', '-c']
+    command:
+      - >
+        bootstrap-mtls.sh --out-dir /tls --api-san sandbox-api
+        --control-san-prefix sandbox-runner --world-readable &&
+        chown -R sandbox-api:sandbox-api /tls/api && chmod -R a+rX /tls
+    environment:
+      NUM_RUNNERS: '1'
+    volumes:
+      - sandbox_tls:/tls
+    networks:
+      - sandbox
+
+  sandbox-api:
+    image: ghcr.io/n8n-io/n8n-sandbox-service-api:1.8.1
+    restart: unless-stopped
+    depends_on:
+      sandbox-certs:
+        condition: service_completed_successfully
+    env_file: ./sandbox/api.env
+    environment:
+      SANDBOX_API_GRPC_TLS_CERT_FILE: /tls/api/grpc-server.crt
+      SANDBOX_API_GRPC_TLS_KEY_FILE: /tls/api/grpc-server.key
+      SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE: /tls/api/ca.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE: /tls/api/ca.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE: /tls/api/control-grpc-api-client.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE: /tls/api/control-grpc-api-client.key
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_SERVER_NAME: sandbox-runner-1
+    volumes:
+      - sandbox_tls:/tls:ro
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:8080/healthz']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - sandbox
+
+  sandbox-runner-1:
+    image: ghcr.io/n8n-io/n8n-sandbox-service-runner-dind:1.8.1
+    privileged: true            # Docker-in-Docker; root-equivalent — never publish its ports
+    restart: unless-stopped
+    stop_grace_period: 90s      # lets the runner drain and remove sandboxes before dockerd stops
+    depends_on:
+      sandbox-api:
+        condition: service_healthy
+    env_file: ./sandbox/runner.env
+    environment:
+      SANDBOX_RUNNER_API_GRPC_ADDR: sandbox-api:9090
+      SANDBOX_RUNNER_HTTP_BASE_URL: https://sandbox-runner-1:8080
+      SANDBOX_RUNNER_CONTROL_GRPC_LISTEN_ADDR: ':9091'
+      SANDBOX_RUNNER_CONTROL_GRPC_ADVERTISE_ADDR: sandbox-runner-1:9091
+      SANDBOX_RUNNER_ID: runner-1
+      SANDBOX_RUNNER_DOCKER_SANDBOX_IMAGE: ghcr.io/n8n-io/n8n-sandbox-service-sandbox:1.8.1
+      SANDBOX_RUNNER_REGISTRATION_GRPC_CA_FILE: /tls/runner/ca.crt
+      SANDBOX_RUNNER_REGISTRATION_GRPC_CERT_FILE: /tls/runner/grpc-client.crt
+      SANDBOX_RUNNER_REGISTRATION_GRPC_KEY_FILE: /tls/runner/grpc-client.key
+      SANDBOX_RUNNER_REGISTRATION_GRPC_SERVER_NAME: sandbox-api
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_CERT_FILE: /tls/runner/control-grpc-server.crt
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_KEY_FILE: /tls/runner/control-grpc-server.key
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_CLIENT_CA_FILE: /tls/runner/ca.crt
+    volumes:
+      - sandbox_tls:/tls:ro
+    networks:
+      - sandbox
+
+volumes:
+  postgres_data:
+  n8n_data:
+  sandbox_tls:          # generated mTLS certs only
+
+networks:
+  netopsai:
+    driver: bridge
+  sandbox:              # isolates sandbox containers from postgres/backend/frontend
+    driver: bridge

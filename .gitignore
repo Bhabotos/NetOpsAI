@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+sandbox/*.env
+
+# Dependencies / build output
+node_modules/
+dist/
+
+# Local backups and logs
+*.bak-before-sandbox
+*.log
+.DS_Store

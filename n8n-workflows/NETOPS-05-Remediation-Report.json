@@ -1,0 +1,214 @@
+{
+  "name": "NETOPS-05-Remediation-Report",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "execute-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build full remediation context from all specialist results\nconst trigger = $input.first().json;\n\n// Safe parse — the orchestrator passes JSON strings\nconst safeparse = (v) => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return v || {}; } };\n\nconst classification = safeparse(trigger.classification_result) || {};\nconst rca            = safeparse(trigger.rca_result)            || {};\nconst topology       = safeparse(trigger.topology_result)       || {};\n\nconst context = {\n  incident: {\n    incident_id:  trigger.incident_id,\n    alarm_id:     trigger.alarm_id,\n    device_name:  trigger.device_name,\n    alarm_type:   trigger.alarm_type,\n    severity:     trigger.severity,\n    description:  trigger.description,\n    timestamp:    trigger.alarm_timestamp,\n  },\n  classification: {\n    alarm_category:    classification.alarm_category || 'Unknown',\n    alarm_subtype:     classification.alarm_subtype  || trigger.alarm_type,\n    severity:          classification.severity       || trigger.severity,\n    is_service_affecting: classification.is_service_affecting ?? true,\n    urgency:           classification.urgency        || 'Medium',\n  },\n  root_cause: {\n    probable_root_cause:      rca.probable_root_cause      || 'Under investigation',\n    root_cause_category:      rca.root_cause_category      || 'Unknown',\n    confidence:               rca.confidence               || 0,\n    requires_physical_inspection: rca.requires_physical_inspection ?? false,\n    estimated_repair_time_hours:  rca.estimated_repair_time_hours || null,\n    timeline_analysis:            rca.timeline_analysis || '',\n    supporting_evidence:          rca.supporting_evidence || [],\n    alternative_causes:           rca.alternative_causes  || [],\n  },\n  impact: {\n    impact_level:               topology.impact_level        || 'Unknown',\n    affected_nodes:             topology.affected_nodes      || [trigger.device_name],\n    affected_services:          topology.affected_services   || [],\n    traffic_rerouting_possible: topology.traffic_rerouting_possible ?? false,\n    redundant_paths_available:  topology.redundant_paths_available  ?? false,\n    estimated_customers_affected: topology.estimated_customers_affected || 0,\n    cascade_risk:               topology.cascade_risk || '',\n  },\n  agent_started_at: new Date().toISOString(),\n};\n\nreturn [{ json: { context } }];"
+      },
+      "id": "build-remediation-context",
+      "name": "Build Remediation Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ 'You are a Network Remediation & Incident Report Agent. All actions you recommend are READ-ONLY suggestions that require human approval before execution.\\n\\nINCIDENT CONTEXT:\\n' + JSON.stringify($json.context, null, 2) + '\\n\\nBased on the classification, root cause analysis, and topology impact, generate structured remediation recommendations and a complete incident report.\\n\\nIMPORTANT: All recommended_actions are READ-ONLY diagnostic steps. Do NOT recommend any configuration changes, device reboots, or traffic rerouting commands — those require human approval and are outside your scope.\\n\\nRespond ONLY with a valid JSON object matching this exact schema:\\n{\\n  \"recommended_actions\": [\\n    {\\n      \"priority\": <1, 2, 3, ...>,\\n      \"action_type\": \"<Diagnostic|Monitoring|Escalation|Documentation>\",\\n      \"title\": \"<short action title>\",\\n      \"description\": \"<detailed step description>\",\\n      \"estimated_duration_minutes\": <number>,\\n      \"requires_human_approval\": <true|false>,\\n      \"cli_commands\": [\"<show command only — no config commands>\"]\\n    }\\n  ],\\n  \"escalation_required\": <true|false>,\\n  \"escalation_team\": \"<NOC|Field Engineering|Vendor Support|Management|None>\",\\n  \"escalation_reason\": \"<why escalation is needed, or null>\",\\n  \"preventive_measures\": [\"<long-term prevention recommendations>\"],\\n  \"incident_report\": \"<full human-readable incident report in markdown format covering: Executive Summary, Timeline, Technical Analysis, Impact Assessment, Root Cause, Recommended Actions, Next Steps>\",\\n  \"report_generated_at\": \"<ISO timestamp>\"\\n}\\n\\nRespond ONLY with the JSON object. No outer markdown.' }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are a network remediation AI. All your action recommendations are read-only and advisory. Never recommend configuration changes without explicit human approval framing. Respond with valid JSON only."
+            }
+          ]
+        }
+      },
+      "id": "remediation-agent",
+      "name": "Remediation AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [
+        680,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate Remediation Agent output\nconst raw         = $input.first().json;\nconst agentOutput = typeof raw.text === 'string' ? raw.text : (typeof raw.content === 'string' ? raw.content : '');\n// chainLlm runs with onError=continue, so a failed LLM call arrives here as { error }\nconst llmError    = raw.error ? (typeof raw.error === 'string' ? raw.error : JSON.stringify(raw.error)) : null;\nconst context     = $('Build Remediation Context').first().json.context;\n\nlet parsed;\ntry {\n  if (llmError) throw new Error('LLM call failed: ' + llmError);\n  const cleaned = agentOutput.replace(/```json?\\n?/g, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = {\n    recommended_actions: [\n      {\n        priority: 1,\n        action_type: 'Diagnostic',\n        title: 'Manual investigation required',\n        description: 'AI agent output could not be parsed. Manual NOC investigation is required.',\n        estimated_duration_minutes: 30,\n        requires_human_approval: true,\n        cli_commands: [],\n      }\n    ],\n    escalation_required: true,\n    escalation_team: 'NOC',\n    escalation_reason: 'AI analysis failed — manual review needed',\n    preventive_measures: [],\n    incident_report: `# Incident Report\\n\\n**Incident ID:** ${context.incident.incident_id}\\n**Device:** ${context.incident.device_name}\\n**Alarm:** ${context.incident.alarm_type}\\n\\n⚠️ Automated report generation failed. Manual investigation required.\\n\\n**Error:** ${e.message}`,\n    report_generated_at: new Date().toISOString(),\n    parse_error: e.message,\n  };\n}\n\n// Validate structure\nif (!Array.isArray(parsed.recommended_actions))  parsed.recommended_actions = [];\nif (!Array.isArray(parsed.preventive_measures))  parsed.preventive_measures = [];\nif (!parsed.report_generated_at) parsed.report_generated_at = new Date().toISOString();\n\n// ── Command safety policy: strict allowlist of read-only commands ────────────\n// Nothing here is ever executed — these are suggestions shown to a human — but anything\n// that is not provably read-only is removed so it can't be copy-pasted onto a device.\nconst POLICY = 'read-only-allowlist-v1';\nconst ALLOWED_ACTION_TYPES = ['Diagnostic', 'Monitoring', 'Escalation', 'Documentation'];\nconst NO_CLI_ACTION_TYPES  = ['Escalation', 'Documentation'];   // people/process steps, not device commands\nconst MAX_ACTIONS = 10;\nconst MAX_COMMANDS_PER_ACTION = 5;\n\n// verb -> allowed first topic word (show: Cisco/Juniper/Nokia/Ciena, display: Huawei)\nconst SHOW_TOPICS = [\n  'interface', 'interfaces', 'ip', 'ipv6', 'bgp', 'ospf', 'isis', 'mpls', 'route', 'arp', 'lldp', 'cdp',\n  'log', 'logging', 'version', 'inventory', 'environment', 'processes', 'memory', 'controllers',\n  'optics', 'transceiver', 'transceivers', 'alarm', 'alarms', 'system', 'chassis', 'platform', 'hardware',\n  'redundancy', 'ethernet', 'vlan', 'vlans', 'spanning-tree', 'ntp', 'clock', 'module', 'modules', 'card',\n  'port', 'ports', 'lag', 'lacp', 'protection', 'aps', 'performance', 'pm', 'counters', 'statistics',\n];\nconst ALLOWED = {\n  show:    new Set(SHOW_TOPICS),\n  display: new Set([...SHOW_TOPICS, 'logbuffer', 'trapbuffer', 'device', 'elabel', 'cpu-usage', 'memory-usage']),\n};\n// Rejected anywhere in a command, even after an allowed verb\nconst FORBIDDEN_WORDS = new Set([\n  'configure', 'config', 'conf', 'commit', 'write', 'copy', 'delete', 'erase', 'reload', 'reboot', 'restart',\n  'shutdown', 'no', 'clear', 'debug', 'undebug', 'set', 'unset', 'request', 'rollback', 'format', 'undo',\n  'system-view', 'save', 'reset', 'install', 'upgrade', 'test', 'tech-support',\n  // would print secrets (password hashes, keys, SNMP communities)\n  'running-config', 'startup-config', 'configuration', 'current-configuration', 'saved-configuration',\n]);\nconst CHAINING   = /[;|&`$<>\\\\\\n\\r'\"(){}]/;          // chaining, pipes, redirection, substitution, quoting\nconst SAFE_CHARS = /^[A-Za-z0-9 ._:\\/,-]+$/;\nconst EXTERNAL   = /(https?:|ftp:|mailto:|@|\\b(email|e-mail|mail|sms|webhook|curl|wget|ssh|telnet|scp|sftp|api)\\b)/i;\n\nconst checkCommand = (cmd) => {\n  if (typeof cmd !== 'string') return 'not a string';\n  const c = cmd.trim().replace(/\\s+/g, ' ');\n  if (!c) return 'empty command';\n  if (c.length > 150) return 'too long';\n  if (CHAINING.test(c)) return 'chained/redirected/substituted command';\n  if (EXTERNAL.test(c)) return 'external action';\n  if (!SAFE_CHARS.test(c)) return 'disallowed characters';\n  const words = c.toLowerCase().split(' ');\n  const bad = words.find(w => FORBIDDEN_WORDS.has(w));\n  if (bad) return `forbidden keyword '${bad}'`;\n  const [verb, topic] = words;\n  if (!ALLOWED[verb]) return `unknown command '${verb}' (only show/display allowed)`;\n  if (!topic || !ALLOWED[verb].has(topic)) return `'${verb} ${topic || ''}' is not on the read-only allowlist`;\n  return null;\n};\n\nconst rejectedCommands = [];\nconst rejectedActions  = [];\nlet allowedCount = 0;\n\nparsed.recommended_actions = parsed.recommended_actions\n  .filter(a => {\n    if (!a || typeof a !== 'object') { rejectedActions.push({ title: null, reason: 'not an object' }); return false; }\n    if (!ALLOWED_ACTION_TYPES.includes(a.action_type)) {\n      rejectedActions.push({ title: a.title || null, reason: `action_type '${a.action_type}' not allowed` });\n      return false;\n    }\n    return true;\n  })\n  .slice(0, MAX_ACTIONS)\n  .map((a, i) => {\n    const title = String(a.title || `Action ${i + 1}`).slice(0, 200);\n    const cmds  = Array.isArray(a.cli_commands) ? a.cli_commands : [];\n    const safe  = [];\n    for (const cmd of cmds) {\n      const reason = NO_CLI_ACTION_TYPES.includes(a.action_type)\n        ? `${a.action_type} actions carry no device commands`\n        : (safe.length >= MAX_COMMANDS_PER_ACTION ? 'too many commands for one action' : checkCommand(cmd));\n      if (reason) rejectedCommands.push({ action: title, command: String(cmd).slice(0, 200), reason });\n      else safe.push(cmd.trim().replace(/\\s+/g, ' '));\n    }\n    allowedCount += safe.length;\n    // Its whole purpose was an unsafe command: drop it so the description can't instruct one either\n    if (cmds.length > 0 && safe.length === 0 && !NO_CLI_ACTION_TYPES.includes(a.action_type)) {\n      rejectedActions.push({ title, reason: 'all suggested commands failed the read-only policy' });\n      return null;\n    }\n    return {\n      priority:                   Number.isInteger(a.priority) && a.priority > 0 ? a.priority : i + 1,\n      action_type:                a.action_type,\n      title,\n      description:                String(a.description || '').slice(0, 1000),\n      estimated_duration_minutes: Number.isFinite(a.estimated_duration_minutes) ? a.estimated_duration_minutes : null,\n      cli_commands:               safe,\n      requires_human_approval:    true,   // always enforced, regardless of LLM output\n      auto_execute:               false,  // NetOpsAI never runs commands on devices\n    };\n  })\n  .filter(Boolean);\n\nif (parsed.recommended_actions.length === 0) {\n  parsed.recommended_actions = [{\n    priority: 1, action_type: 'Diagnostic', title: 'Manual investigation required',\n    description: 'No AI-suggested action passed the read-only safety policy. Manual NOC investigation is required.',\n    estimated_duration_minutes: 30, cli_commands: [], requires_human_approval: true, auto_execute: false,\n  }];\n}\n\nparsed.command_validation = {\n  policy:            POLICY,\n  allowed_commands:  allowedCount,\n  rejected_commands: rejectedCommands,\n  rejected_actions:  rejectedActions,\n};\n\nconst validTeams = ['NOC','Field Engineering','Vendor Support','Management','None'];\nif (!validTeams.includes(parsed.escalation_team)) parsed.escalation_team = 'NOC';\n\nreturn [{\n  json: {\n    ...parsed,\n    alarm_id:     context.incident.alarm_id,\n    incident_id:  context.incident.incident_id,\n    agent_name:   'remediation_report',\n    completed_at: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "parse-remediation",
+      "name": "Parse & Validate Remediation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO agent_execution_logs\n  (incident_id, alarm_id, agent_name, execution_status, error_message, input_data, output_data, duration_ms, started_at, completed_at)\nVALUES ($1::uuid, NULLIF($2, '')::uuid, 'remediation_report', $3, NULLIF($4, ''), $5::jsonb, $6::jsonb,\n  (EXTRACT(EPOCH FROM ($8::timestamptz - $7::timestamptz)) * 1000)::int, $7::timestamptz, $8::timestamptz)\nRETURNING log_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, $json.alarm_id || '', $json.parse_error ? 'failed' : 'success', $json.parse_error || '', JSON.stringify($('Build Remediation Context').first().json.context), JSON.stringify($json), $('Build Remediation Context').first().json.context.agent_started_at, $json.completed_at ] }}"
+        }
+      },
+      "id": "log-remediation",
+      "name": "Log Remediation Execution",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1120,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "netopsai-postgres",
+          "name": "NetOpsAI PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $('Parse & Validate Remediation').first().json }];"
+      },
+      "id": "return-remediation",
+      "name": "Return Remediation Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {
+          "temperature": 0.3,
+          "responseFormat": "json_object",
+          "timeout": 300000,
+          "maxRetries": 1
+        }
+      },
+      "id": "remediation-agent-model",
+      "name": "Remediation AI Agent Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        680,
+        520
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "netopsai-openai",
+          "name": "NetOpsAI OpenAI / LLM"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Remediation Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Remediation Context": {
+      "main": [
+        [
+          {
+            "node": "Remediation AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remediation AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Remediation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Remediation": {
+      "main": [
+        [
+          {
+            "node": "Log Remediation Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Remediation Execution": {
+      "main": [
+        [
+          {
+            "node": "Return Remediation Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remediation AI Agent Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Remediation AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "tags": [
+    {
+      "id": "NetOpsAiTag00001",
+      "name": "netopsai"
+    },
+    {
+      "id": "NetOpsAiTag00003",
+      "name": "specialist-agent"
+    }
+  ],
+  "pinData": {},
+  "id": "NETOPS05REMEDIAT"
+}

@@ -1,0 +1,286 @@
+{
+  "name": "NETOPS-03-Root-Cause-Analysis",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "execute-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT alarm_type, severity, alarm_timestamp, processing_status FROM network_alarms\nWHERE device_name = $1 AND alarm_id <> $2::uuid\nORDER BY alarm_timestamp DESC LIMIT 10",
+        "options": {
+          "queryReplacement": "={{ [ $json.device_name, $json.alarm_id ] }}"
+        }
+      },
+      "id": "fetch-recent-alarms",
+      "name": "Fetch Recent Alarms (Same Device)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "netopsai-postgres",
+          "name": "NetOpsAI PostgreSQL"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT device_type, vendor, model, location, network_role, ip_address::text AS ip_address, management_ip::text AS management_ip\nFROM network_devices WHERE device_name = $1",
+        "options": {
+          "queryReplacement": "={{ [ $('Execute Workflow Trigger').first().json.device_name ] }}"
+        }
+      },
+      "id": "fetch-device-info",
+      "name": "Fetch Device Info",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "netopsai-postgres",
+          "name": "NetOpsAI PostgreSQL"
+        }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build enriched context for RCA Agent\nconst trigger    = $('Execute Workflow Trigger').first().json;\nconst recentAlarms = $('Fetch Recent Alarms (Same Device)').all().map(i => i.json).filter(a => a.alarm_type);\nconst deviceInfo   = $('Fetch Device Info').first()?.json || {};\n\nconst context = {\n  current_alarm: {\n    alarm_id:        trigger.alarm_id,\n    incident_id:     trigger.incident_id,\n    device_name:     trigger.device_name,\n    alarm_type:      trigger.alarm_type,\n    severity:        trigger.severity,\n    interface_name:  trigger.interface_name || 'N/A',\n    description:     trigger.description,\n    alarm_timestamp: trigger.alarm_timestamp,\n  },\n  device_info: {\n    device_type:     deviceInfo.device_type || 'Unknown',\n    vendor:          deviceInfo.vendor || 'Unknown',\n    model:           deviceInfo.model || 'Unknown',\n    location:        deviceInfo.location || 'Unknown',\n    network_role:    deviceInfo.network_role || 'Unknown',\n    ip_address:      deviceInfo.ip_address || 'N/A',\n    management_ip:   deviceInfo.management_ip || 'N/A',\n  },\n  recent_alarms_same_device: recentAlarms.slice(0, 5).map(a => ({\n    alarm_type: a.alarm_type,\n    severity:   a.severity,\n    timestamp:  a.alarm_timestamp,\n    status:     a.processing_status,\n  })),\n  agent_started_at: new Date().toISOString(),\n};\n\nreturn [{ json: { context } }];"
+      },
+      "id": "build-rca-context",
+      "name": "Build RCA Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ 'You are an expert Root Cause Analysis (RCA) Agent for a Fiber Optic / IP backbone network.\\n\\nALARM CONTEXT:\\n' + JSON.stringify($json.context, null, 2) + '\\n\\nBased on the alarm details, device information, and recent alarm history, perform a thorough root cause analysis.\\n\\nRespond ONLY with a valid JSON object matching this exact schema:\\n{\\n  \"probable_root_cause\": \"<concise description of most likely root cause>\",\\n  \"confidence\": <0.0 to 1.0>,\\n  \"root_cause_category\": \"<Hardware Failure|Fiber Cut|Configuration Error|Software Bug|Environmental|External Attack|Human Error|Unknown>\",\\n  \"supporting_evidence\": [\\n    { \"evidence\": \"<observation>\", \"weight\": \"<High|Medium|Low>\" }\\n  ],\\n  \"alternative_causes\": [\\n    { \"cause\": \"<alternative explanation>\", \"probability\": <0.0 to 1.0> }\\n  ],\\n  \"timeline_analysis\": \"<brief timeline of what likely happened>\",\\n  \"correlation_with_recent_alarms\": \"<how recent alarms relate to this event>\",\\n  \"requires_physical_inspection\": <true|false>,\\n  \"estimated_repair_time_hours\": <number or null>\\n}\\n\\nRespond ONLY with the JSON object. No markdown, no explanation.' }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are a network RCA expert AI. Always respond with valid JSON only. Base your analysis only on the information provided — never invent device data."
+            }
+          ]
+        }
+      },
+      "id": "rca-agent",
+      "name": "RCA AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [
+        900,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate RCA Agent output\nconst raw         = $input.first().json;\nconst agentOutput = typeof raw.text === 'string' ? raw.text : (typeof raw.content === 'string' ? raw.content : '');\n// chainLlm runs with onError=continue, so a failed LLM call arrives here as { error }\nconst llmError    = raw.error ? (typeof raw.error === 'string' ? raw.error : JSON.stringify(raw.error)) : null;\nconst context     = $('Build RCA Context').first().json.context;\n\nlet parsed;\ntry {\n  if (llmError) throw new Error('LLM call failed: ' + llmError);\n  const cleaned = agentOutput.replace(/```json?\\n?/g, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = {\n    probable_root_cause:     'Unable to determine — analysis failed',\n    confidence:              0.1,\n    root_cause_category:     'Unknown',\n    supporting_evidence:     [],\n    alternative_causes:      [],\n    timeline_analysis:       'Analysis failed: ' + e.message,\n    correlation_with_recent_alarms: 'N/A',\n    requires_physical_inspection: true,\n    estimated_repair_time_hours: null,\n    parse_error: e.message,\n  };\n}\n\n// Ensure arrays\nif (!Array.isArray(parsed.supporting_evidence)) parsed.supporting_evidence = [];\nif (!Array.isArray(parsed.alternative_causes))  parsed.alternative_causes = [];\n\nconst validCategories = ['Hardware Failure','Fiber Cut','Configuration Error','Software Bug','Environmental','External Attack','Human Error','Unknown'];\nif (!validCategories.includes(parsed.root_cause_category)) parsed.root_cause_category = 'Unknown';\n\nreturn [{\n  json: {\n    ...parsed,\n    alarm_id:     context.current_alarm.alarm_id,\n    incident_id:  context.current_alarm.incident_id,\n    agent_name:   'root_cause_analysis',\n    completed_at: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "parse-rca",
+      "name": "Parse RCA Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO agent_execution_logs\n  (incident_id, alarm_id, agent_name, execution_status, error_message, input_data, output_data, duration_ms, started_at, completed_at)\nVALUES ($1::uuid, NULLIF($2, '')::uuid, 'root_cause_analysis', $3, NULLIF($4, ''), $5::jsonb, $6::jsonb,\n  (EXTRACT(EPOCH FROM ($8::timestamptz - $7::timestamptz)) * 1000)::int, $7::timestamptz, $8::timestamptz)\nRETURNING log_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, $json.alarm_id || '', $json.parse_error ? 'failed' : 'success', $json.parse_error || '', JSON.stringify($('Build RCA Context').first().json.context), JSON.stringify($json), $('Build RCA Context').first().json.context.agent_started_at, $json.completed_at ] }}"
+        }
+      },
+      "id": "log-rca",
+      "name": "Log RCA Execution",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "netopsai-postgres",
+          "name": "NetOpsAI PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $('Parse RCA Output').first().json }];"
+      },
+      "id": "return-rca",
+      "name": "Return RCA Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {
+          "temperature": 0.2,
+          "responseFormat": "json_object",
+          "timeout": 300000,
+          "maxRetries": 1
+        }
+      },
+      "id": "rca-agent-model",
+      "name": "RCA AI Agent Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        900,
+        520
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "netopsai-openai",
+          "name": "NetOpsAI OpenAI / LLM"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Recent Alarms (Same Device)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Recent Alarms (Same Device)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Device Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Device Info": {
+      "main": [
+        [
+          {
+            "node": "Build RCA Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build RCA Context": {
+      "main": [
+        [
+          {
+            "node": "RCA AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RCA AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse RCA Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse RCA Output": {
+      "main": [
+        [
+          {
+            "node": "Log RCA Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log RCA Execution": {
+      "main": [
+        [
+          {
+            "node": "Return RCA Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RCA AI Agent Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "RCA AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "tags": [
+    {
+      "id": "NetOpsAiTag00001",
+      "name": "netopsai"
+    },
+    {
+      "id": "NetOpsAiTag00003",
+      "name": "specialist-agent"
+    }
+  ],
+  "pinData": {},
+  "id": "NETOPS03RCAAGENT"
+}

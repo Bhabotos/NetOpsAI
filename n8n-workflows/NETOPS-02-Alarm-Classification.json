@@ -1,0 +1,214 @@
+{
+  "name": "NETOPS-02-Alarm-Classification",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "execute-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare structured context for Classification Agent\nconst data = $input.first().json;\n\nconst context = {\n  alarm_id:        data.alarm_id,\n  incident_id:     data.incident_id,\n  device_name:     data.device_name,\n  alarm_type:      data.alarm_type,\n  reported_severity: data.severity,\n  interface_name:  data.interface_name || 'N/A',\n  description:     data.description,\n  alarm_timestamp: data.alarm_timestamp,\n  agent_started_at: new Date().toISOString(),\n};\n\nreturn [{ json: { context, input: data } }];"
+      },
+      "id": "prepare-context",
+      "name": "Prepare Classification Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ 'You are a Network Alarm Classification Agent for a Fiber Optic / IP backbone network. Your task is to classify the given network alarm.\\n\\nALARM DETAILS:\\n- Alarm ID: ' + $json.context.alarm_id + '\\n- Device: ' + $json.context.device_name + '\\n- Alarm Type: ' + $json.context.alarm_type + '\\n- Reported Severity: ' + $json.context.reported_severity + '\\n- Interface: ' + $json.context.interface_name + '\\n- Description: ' + $json.context.description + '\\n- Timestamp: ' + $json.context.alarm_timestamp + '\\n\\nClassify this alarm and respond ONLY with a valid JSON object matching this exact schema:\\n{\\n  \"alarm_category\": \"<Physical Layer|Data Link Layer|Network Layer|Service Layer|Environmental>\",\\n  \"severity\": \"<Critical|Major|Minor|Warning|Info>\",\\n  \"alarm_subtype\": \"<specific subtype, e.g. Optical Fiber Cut, Port Failure, Routing Loop>\",\\n  \"is_service_affecting\": <true|false>,\\n  \"urgency\": \"<Immediate|High|Medium|Low>\",\\n  \"estimated_impact_scope\": \"<Single Device|Multiple Devices|Service Outage|No Impact>\",\\n  \"classification_confidence\": <0.0 to 1.0>,\\n  \"classification_rationale\": \"<1-2 sentence explanation>\",\\n  \"tags\": [\"<tag1>\", \"<tag2>\"]\\n}\\n\\nRespond ONLY with the JSON object. No markdown, no explanation.' }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "You are a precise network alarm classification AI. Always respond with valid JSON only. Never include markdown fences or explanations outside the JSON."
+            }
+          ]
+        }
+      },
+      "id": "classification-agent",
+      "name": "Classification AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [
+        680,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate LLM output\nconst raw         = $input.first().json;\nconst agentOutput = typeof raw.text === 'string' ? raw.text : (typeof raw.content === 'string' ? raw.content : '');\n// chainLlm runs with onError=continue, so a failed LLM call arrives here as { error }\nconst llmError    = raw.error ? (typeof raw.error === 'string' ? raw.error : JSON.stringify(raw.error)) : null;\nconst context     = $('Prepare Classification Context').first().json.context;\n\nlet parsed;\ntry {\n  if (llmError) throw new Error('LLM call failed: ' + llmError);\n  // Strip markdown fences if present\n  const cleaned = agentOutput.replace(/```json?\\n?/g, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  // Fallback classification if JSON parse fails\n  parsed = {\n    alarm_category:           'Unknown',\n    severity:                 context.reported_severity,\n    alarm_subtype:            context.alarm_type,\n    is_service_affecting:     context.reported_severity === 'Critical' || context.reported_severity === 'Major',\n    urgency:                  context.reported_severity === 'Critical' ? 'Immediate' : 'Medium',\n    estimated_impact_scope:   'Single Device',\n    classification_confidence: 0.3,\n    classification_rationale:  'Fallback classification — LLM output could not be parsed.',\n    tags:                     [context.alarm_type],\n    parse_error:              e.message,\n  };\n}\n\n// Validate required fields\nconst validCategories = ['Physical Layer','Data Link Layer','Network Layer','Service Layer','Environmental','Unknown'];\nconst validSeverities  = ['Critical','Major','Minor','Warning','Info'];\nconst validUrgencies   = ['Immediate','High','Medium','Low'];\n\nif (!validCategories.includes(parsed.alarm_category)) parsed.alarm_category = 'Unknown';\nif (!validSeverities.includes(parsed.severity))       parsed.severity = context.reported_severity;\nif (!validUrgencies.includes(parsed.urgency))         parsed.urgency = 'Medium';\n\nreturn [{\n  json: {\n    ...parsed,\n    alarm_id:    context.alarm_id,\n    incident_id: context.incident_id,\n    agent_name:  'alarm_classification',\n    completed_at: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "parse-validate",
+      "name": "Parse & Validate Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO agent_execution_logs\n  (incident_id, alarm_id, agent_name, execution_status, error_message, input_data, output_data, duration_ms, started_at, completed_at)\nVALUES ($1::uuid, NULLIF($2, '')::uuid, 'alarm_classification', $3, NULLIF($4, ''), $5::jsonb, $6::jsonb,\n  (EXTRACT(EPOCH FROM ($8::timestamptz - $7::timestamptz)) * 1000)::int, $7::timestamptz, $8::timestamptz)\nRETURNING log_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.incident_id, $json.alarm_id || '', $json.parse_error ? 'failed' : 'success', $json.parse_error || '', JSON.stringify($('Prepare Classification Context').first().json.context), JSON.stringify($json), $('Prepare Classification Context').first().json.context.agent_started_at, $json.completed_at ] }}"
+        }
+      },
+      "id": "log-execution",
+      "name": "Log Agent Execution",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1120,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "netopsai-postgres",
+          "name": "NetOpsAI PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Return classification result to orchestrator\nconst result = $('Parse & Validate Output').first().json;\nreturn [{ json: result }];"
+      },
+      "id": "return-result",
+      "name": "Return Classification Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {
+          "temperature": 0.1,
+          "responseFormat": "json_object",
+          "timeout": 300000,
+          "maxRetries": 1
+        }
+      },
+      "id": "classification-agent-model",
+      "name": "Classification AI Agent Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        680,
+        520
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "netopsai-openai",
+          "name": "NetOpsAI OpenAI / LLM"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Classification Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Classification Context": {
+      "main": [
+        [
+          {
+            "node": "Classification AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Output": {
+      "main": [
+        [
+          {
+            "node": "Log Agent Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Agent Execution": {
+      "main": [
+        [
+          {
+            "node": "Return Classification Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification AI Agent Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Classification AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "tags": [
+    {
+      "id": "NetOpsAiTag00001",
+      "name": "netopsai"
+    },
+    {
+      "id": "NetOpsAiTag00003",
+      "name": "specialist-agent"
+    }
+  ],
+  "pinData": {},
+  "id": "NETOPS02CLASSIFY"
+}
