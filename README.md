@@ -430,6 +430,55 @@ netopsai/
 
 ---
 
+## NetOpsAI Architecture and Workflow Screenshots
+
+### Architecture
+
+![NetOpsAI Architecture](docs/images/Architecture%20Drawing.png)
+
+**Network Infrastructure → Alarm Sources → n8n AI Agents → Backend API → PostgreSQL → React Dashboard.**
+Network devices raise alarms, the n8n orchestrator (NETOPS-01) dispatches them to the specialist AI agents
+(NETOPS-02 to NETOPS-05), results are stored in PostgreSQL, and the Express backend serves them to the React NOC dashboard.
+
+> **Note:** This diagram shows the *conceptual / target* architecture. SNMP Traps, Syslog, Nokia NSP and a
+> direct n8n → backend API integration are conceptual sources/components and are not fully implemented in the
+> current project. Today alarms enter through the dashboard's **Simulate Alarm** (`POST /api/alarms/simulate`)
+> or the NETOPS-01 webhook, and the n8n workflows read and write PostgreSQL directly.
+
+### NOC Dashboard
+
+![NetOpsAI NOC Dashboard](docs/images/Netops%20dashboard.png)
+
+### n8n Workflows
+
+#### NETOPS-01 — Incident Orchestrator
+
+![NETOPS-01 Incident Orchestrator](docs/images/NETOPS-01%20Incident%20Orchestrator.png)
+
+#### NETOPS-02 — Alarm Classification
+
+![NETOPS-02 Alarm Classification](docs/images/NETOPS-02%20Alarm%20Classification.png)
+
+#### NETOPS-03 — Root Cause Analysis
+
+![NETOPS-03 Root Cause Analysis](docs/images/NETOPS-03%20Root%20Cause%20Analysis.png)
+
+#### NETOPS-04 — Topology Impact
+
+![NETOPS-04 Topology Impact](docs/images/NETOPS-04%20Topology%20Impact.png)
+
+#### NETOPS-05 — Remediation Report
+
+![NETOPS-05 Remediation Report](docs/images/NETOPS-05%20Remediation%20Report.png)
+
+#### NETOPS-06 — Alarm Intake API
+
+![NETOPS-06 Alarm Intake API](docs/images/NETOPS-06%20Alarm%20Intake%20API.png)
+
+> **Note:** NETOPS-06 is included as a screenshot only. Its workflow JSON is not included in this repository.
+
+---
+
 ## License
 
 MIT — built as a portfolio demonstration. Not intended for production network operations.
